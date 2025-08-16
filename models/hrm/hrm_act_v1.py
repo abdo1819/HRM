@@ -32,8 +32,9 @@ class HierarchicalReasoningModel_ACTV1Config(BaseModel):
     batch_size: int
     seq_len: int
     puzzle_emb_ndim: int = 0
-    num_puzzle_identifiers: int
+    num_puzzle_identifiers: int = 0
     vocab_size: int
+    feature_dim: Optional[int] = None
 
     H_cycles: int
     L_cycles: int
@@ -109,7 +110,11 @@ class HierarchicalReasoningModel_ACTV1_Inner(nn.Module):
         self.embed_scale  = math.sqrt(self.config.hidden_size)
         embed_init_std = 1.0 / self.embed_scale
 
-        self.embed_tokens = CastedEmbedding(self.config.vocab_size, self.config.hidden_size, init_std=embed_init_std, cast_to=self.forward_dtype)
+        if self.config.feature_dim is None:
+            self.embed_tokens = CastedEmbedding(self.config.vocab_size, self.config.hidden_size, init_std=embed_init_std, cast_to=self.forward_dtype)
+        else:
+            self.embed_tokens = None
+            self.audio_proj = CastedLinear(self.config.feature_dim, self.config.hidden_size, bias=False, cast_to=self.forward_dtype)
         self.lm_head      = CastedLinear(self.config.hidden_size, self.config.vocab_size, bias=False)
         self.q_head       = CastedLinear(self.config.hidden_size, 2, bias=True)
 
@@ -143,19 +148,22 @@ class HierarchicalReasoningModel_ACTV1_Inner(nn.Module):
             self.q_head.weight.zero_()
             self.q_head.bias.fill_(-5)  # type: ignore
 
-    def _input_embeddings(self, input: torch.Tensor, puzzle_identifiers: torch.Tensor):
-        # Token embedding
-        embedding = self.embed_tokens(input.to(torch.int32))
+    def _input_embeddings(self, input: torch.Tensor, puzzle_identifiers: Optional[torch.Tensor] = None):
+        # Token or feature embedding
+        if self.config.feature_dim is None:
+            embedding = self.embed_tokens(input.to(torch.int32))
 
-        # Puzzle embeddings
-        if self.config.puzzle_emb_ndim > 0:
-            puzzle_embedding = self.puzzle_emb(puzzle_identifiers)
-            
-            pad_count = self.puzzle_emb_len * self.config.hidden_size - puzzle_embedding.shape[-1]
-            if pad_count > 0:
-                puzzle_embedding = F.pad(puzzle_embedding, (0, pad_count))
+            # Puzzle embeddings
+            if (self.config.puzzle_emb_ndim > 0) and (puzzle_identifiers is not None):
+                puzzle_embedding = self.puzzle_emb(puzzle_identifiers)
 
-            embedding = torch.cat((puzzle_embedding.view(-1, self.puzzle_emb_len, self.config.hidden_size), embedding), dim=-2)
+                pad_count = self.puzzle_emb_len * self.config.hidden_size - puzzle_embedding.shape[-1]
+                if pad_count > 0:
+                    puzzle_embedding = F.pad(puzzle_embedding, (0, pad_count))
+
+                embedding = torch.cat((puzzle_embedding.view(-1, self.puzzle_emb_len, self.config.hidden_size), embedding), dim=-2)
+        else:
+            embedding = self.audio_proj(input.to(self.forward_dtype))
 
         # Position embeddings
         if self.config.pos_encodings == "learned":
@@ -183,7 +191,7 @@ class HierarchicalReasoningModel_ACTV1_Inner(nn.Module):
         )
 
         # Input encoding
-        input_embeddings = self._input_embeddings(batch["inputs"], batch["puzzle_identifiers"])
+        input_embeddings = self._input_embeddings(batch["inputs"], batch.get("puzzle_identifiers"))
 
         # Forward iterations
         with torch.no_grad():
